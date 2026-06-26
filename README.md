@@ -54,6 +54,21 @@ with **no change to stage code**.
   a fit instead of recomputing.
 - A cgroup **monitor** records peak memory into each completion marker (OOM margin).
 
+## Polars map→reduce
+
+`gleanflow.polars` splits a lazy polars query over many parquet files into small tasks:
+each **map** task scans its partition and writes a partial; one **reduce** task combines
+them. `groupby_agg` auto-derives the reduce for combinable aggregations (sum/min/max/
+count/mean); `map_reduce` takes explicit `map`/`reduce` callables.
+
+```python
+from gleanflow.polars import parquet_source, groupby_agg
+src = parquet_source(pipe, "events", files)
+groupby_agg(pipe, "by_user", source=src, by="user",
+            aggs=[("hits", "count", None), ("spend", "sum", "amount"), ("avg", "mean", "amount")],
+            target_bytes=512_000_000)   # pack ~512MB of files per map task
+```
+
 ## Visualization
 
 `pipe.run(viz=True)` (or `--viz`) starts a local dashboard at

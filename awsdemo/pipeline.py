@@ -9,11 +9,18 @@ APPCODE_S3) imports cleanly as ``awsdemo.pipeline:pipe`` inside the container.
 
 from __future__ import annotations
 
+import os
+
 from gleanflow import Pipeline, PipelineConfig
 
-ACCOUNT = "REDACTED"
-REGION = "us-east-1"
-IMAGE = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/awsdemo-gleanflow:latest"
+# No secrets/account ids in source. Provide your AWS account via env (or set
+# AWSDEMO_IMAGE directly to a full ECR image ref).
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+ACCOUNT = os.environ.get("AWS_ACCOUNT_ID", "")
+IMAGE = os.environ.get(
+    "AWSDEMO_IMAGE",
+    f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/awsdemo-gleanflow:latest" if ACCOUNT else "",
+)
 
 SIZES = {
     "20260501": 3, "20260502": 30, "20260503": 5, "20260504": 50,
@@ -29,7 +36,7 @@ pipe = Pipeline("awsdemo", PipelineConfig(
     max_workers=4,
     worker_idle_timeout=60,
     lease_seconds=300,
-    extra={"bucket_suffix": "61808"},   # pin to the already-provisioned bucket
+    # to pin an already-provisioned bucket, set extra={"bucket_suffix": "<suffix>"}
 ))
 
 days = pipe.source("days", chunks=[

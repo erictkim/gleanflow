@@ -20,6 +20,9 @@ imports cleanly as `awsdemo.pipeline:pipe` inside the container.
 Prereqs: AWS creds, Docker, Terraform on PATH. Region `us-east-1`.
 
 ```bash
+# 0. tell the demo your account (no account ids are hardcoded in source)
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
 # 1. provision infra (S3, SQS+DLQ, Batch Fargate-Spot CE @ vcpu=2, queue, ECR, IAM)
 gleanflow infra apply awsdemo.pipeline:pipe          # terraform apply
 
