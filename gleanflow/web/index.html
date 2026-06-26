@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gleanflow</title>
+<style>
+  :root {
+    --bg:#0b1220; --panel:#121a2b; --panel2:#0f1626; --ink:#e6edf6; --muted:#8aa0bd;
+    --edge:#33415c; --pending:#475569; --queued:#f59e0b; --running:#3b82f6;
+    --success:#22c55e; --failed:#ef4444; --skipped:#14b8a6;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  header { display:flex; align-items:center; gap:18px; padding:12px 18px;
+           border-bottom:1px solid var(--edge); background:var(--panel2); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:15px; margin:0; letter-spacing:.5px; }
+  header h1 b { color:var(--running); }
+  .legend { display:flex; gap:14px; margin-left:auto; flex-wrap:wrap; }
+  .legend span { display:flex; align-items:center; gap:6px; color:var(--muted); }
+  .sw { width:11px; height:11px; border-radius:2px; display:inline-block; }
+  .totals { color:var(--muted); }
+  .totals b { color:var(--ink); }
+  #wrap { position:relative; padding:26px; overflow:auto; }
+  svg#edges { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:0; }
+  #graph { position:relative; display:flex; gap:64px; align-items:flex-start; z-index:1; }
+  .level { display:flex; flex-direction:column; gap:26px; }
+  .stage { background:var(--panel); border:1px solid var(--edge); border-radius:10px;
+           padding:12px 14px; min-width:230px; box-shadow:0 4px 16px rgba(0,0,0,.3); }
+  .stage h2 { margin:0 0 4px; font-size:13px; display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
+  .stage h2 .n { color:var(--muted); font-weight:400; font-size:11px; }
+  .bar { height:5px; border-radius:3px; background:#1e293b; overflow:hidden; display:flex; margin:6px 0 9px; }
+  .bar i { display:block; height:100%; }
+  .cells { display:flex; flex-wrap:wrap; gap:3px; max-width:300px; }
+  .cell { width:11px; height:11px; border-radius:2px; background:var(--pending); transition:background .25s; }
+  .cell.queued{background:var(--queued);} .cell.running{background:var(--running); animation:pulse 1s infinite;}
+  .cell.success{background:var(--success);} .cell.failed{background:var(--failed);} .cell.skipped{background:var(--skipped);}
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.45;} }
+  .meta { color:var(--muted); margin-top:8px; font-size:11px; display:flex; gap:10px; flex-wrap:wrap; }
+  .meta b { color:var(--ink); font-weight:600; }
+  .dot { font-size:10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><b>gleanflow</b> <span id="run"></span></h1>
+  <span class="totals" id="totals"></span>
+  <div class="legend">
+    <span><i class="sw" style="background:var(--pending)"></i>pending</span>
+    <span><i class="sw" style="background:var(--queued)"></i>queued</span>
+    <span><i class="sw" style="background:var(--running)"></i>running</span>
+    <span><i class="sw" style="background:var(--success)"></i>success</span>
+    <span><i class="sw" style="background:var(--failed)"></i>failed</span>
+    <span><i class="sw" style="background:var(--skipped)"></i>skipped</span>
+  </div>
+</header>
+<div id="wrap">
+  <svg id="edges"></svg>
+  <div id="graph"></div>
+</div>
+<script>
+const STATES = ["pending","queued","running","success","failed","skipped"];
+const COLORS = {pending:"#475569",queued:"#f59e0b",running:"#3b82f6",
+                success:"#22c55e",failed:"#ef4444",skipped:"#14b8a6"};
+
+// assign each stage a topological level from its deps
+function levels(stages){
+  const by = {}; stages.forEach(s=>by[s.name]=s);
+  const lv = {};
+  function L(n){
+    if(n in lv) return lv[n];
+    const s = by[n]; if(!s||!s.deps.length){ lv[n]=0; return 0; }
+    lv[n] = 1 + Math.max(...s.deps.map(L));
+    return lv[n];
+  }
+  stages.forEach(s=>L(s.name));
+  return lv;
+}
+
+let built = "";   // signature of current DOM structure to avoid needless rebuilds
+
+function render(state){
+  document.getElementById("run").textContent = "· " + state.run_id;
+  const lv = levels(state.stages);
+  const maxLv = Math.max(0,...Object.values(lv));
+  const sig = state.stages.map(s=>s.name+":"+s.tasks.length).join("|");
+
+  if(sig !== built){
+    built = sig;
+    const graph = document.getElementById("graph");
+    graph.innerHTML = "";
+    for(let i=0;i<=maxLv;i++){
+      const col = document.createElement("div");
+      col.className="level"; col.dataset.lv=i; graph.appendChild(col);
+    }
+    state.stages.forEach(s=>{
+      const col = graph.children[lv[s.name]];
+      const card = document.createElement("div");
+      card.className="stage"; card.id="st-"+s.name;
+      card.innerHTML =
+        `<h2><span>${s.name}</span><span class="n">${s.tasks.length} tasks</span></h2>
+         <div class="bar" id="bar-${s.name}"></div>
+         <div class="cells" id="cells-${s.name}"></div>
+         <div class="meta" id="meta-${s.name}"></div>`;
+      col.appendChild(card);
+      const cells = card.querySelector(".cells");
+      s.tasks.forEach(t=>{
+        const c=document.createElement("div");
+        c.className="cell "+t.state; c.id="c-"+s.name+"-"+t.key;
+        c.title=t.key; cells.appendChild(c);
+      });
+    });
+  }
+
+  const grand = {}; STATES.forEach(s=>grand[s]=0);
+  state.stages.forEach(s=>{
+    s.tasks.forEach(t=>{
+      const el=document.getElementById("c-"+s.name+"-"+t.key);
+      if(el && el.className!=="cell "+t.state) el.className="cell "+t.state;
+      grand[t.state]=(grand[t.state]||0)+1;
+    });
+    // progress bar
+    const total=s.tasks.length||1;
+    const bar=document.getElementById("bar-"+s.name); bar.innerHTML="";
+    STATES.forEach(st=>{
+      const n=s.counts[st]||0; if(!n) return;
+      const i=document.createElement("i");
+      i.style.width=(100*n/total)+"%"; i.style.background=COLORS[st]; bar.appendChild(i);
+    });
+    const done=(s.counts.success||0)+(s.counts.skipped||0);
+    let peak=0,cpu=0;
+    s.tasks.forEach(t=>{ if(t.peak_mem_mb)peak=Math.max(peak,t.peak_mem_mb); if(t.cpu_seconds)cpu+=t.cpu_seconds; });
+    const meta=document.getElementById("meta-"+s.name);
+    meta.innerHTML =
+      `<span><b>${done}</b>/${total} done</span>`+
+      (s.counts.running?`<span>· <b>${s.counts.running}</b> running</span>`:``)+
+      (s.counts.failed?`<span style="color:var(--failed)">· <b>${s.counts.failed}</b> failed</span>`:``)+
+      (peak?`<span>· peak <b>${peak}</b>MB</span>`:``);
+  });
+
+  const tot=Object.entries(grand).filter(([,n])=>n).map(([s,n])=>`${n} ${s}`).join("  ·  ");
+  document.getElementById("totals").innerHTML = tot;
+
+  requestAnimationFrame(()=>drawEdges(state, lv));
+}
+
+function drawEdges(state, lv){
+  const svg=document.getElementById("edges");
+  const wrap=document.getElementById("wrap");
+  const wr=wrap.getBoundingClientRect();
+  svg.setAttribute("width",wrap.scrollWidth); svg.setAttribute("height",wrap.scrollHeight);
+  let defs = `<defs><marker id="arw" markerWidth="9" markerHeight="9" refX="7" refY="3"
+     orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#33415c"/></marker></defs>`;
+  let paths="";
+  state.stages.forEach(s=>{
+    const to=document.getElementById("st-"+s.name); if(!to) return;
+    const tb=to.getBoundingClientRect();
+    s.deps.forEach(d=>{
+      const from=document.getElementById("st-"+d); if(!from) return;
+      const fb=from.getBoundingClientRect();
+      const x1=fb.right-wr.left+wrap.scrollLeft, y1=fb.top+fb.height/2-wr.top+wrap.scrollTop;
+      const x2=tb.left-wr.left+wrap.scrollLeft,  y2=tb.top+tb.height/2-wr.top+wrap.scrollTop;
+      const mx=(x1+x2)/2;
+      paths+=`<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"
+        fill="none" stroke="#33415c" stroke-width="1.6" marker-end="url(#arw)"/>`;
+    });
+  });
+  svg.innerHTML=defs+paths;
+}
+
+async function tick(){
+  try{
+    const r=await fetch("/api/state",{cache:"no-store"});
+    render(await r.json());
+  }catch(e){ /* server gone */ }
+}
+tick(); setInterval(tick, 500);
+window.addEventListener("resize", ()=>fetch("/api/state").then(r=>r.json()).then(s=>drawEdges(s,levels(s.stages))));
+</script>
+</body>
+</html>

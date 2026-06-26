@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gleanflow"
+version = "0.1.0"
+description = "Declarative chunked data pipelines on a scalable AWS Batch worker fleet"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+aws = ["boto3>=1.28"]
+data = ["pyarrow>=14", "pandas>=2.0"]
+dev = ["pytest>=7", "boto3>=1.28", "pyarrow>=14", "pandas>=2.0"]
+
+[project.scripts]
+gleanflow = "gleanflow.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gleanflow*"]
+
+[tool.setuptools.package-data]
+gleanflow = ["web/*.html", "web/*.js", "web/*.css", "infra/*.tmpl", "infra/Dockerfile", "infra/entrypoint.sh"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

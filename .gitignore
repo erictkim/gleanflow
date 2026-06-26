@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.gleanflow/
+.gleanflow-demo/
+.gleanflow-*/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+~/.gleanflow/

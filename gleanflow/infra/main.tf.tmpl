@@ -1,0 +1,141 @@
+# gleanflow infrastructure (always-provision). Rendered by gleanflow.infra.apply.
+# Tokens %%LIKE_THIS%% are substituted with pipeline config before `terraform apply`.
+terraform {
+  required_providers { aws = { source = "hashicorp/aws", version = "~> 5.0" } }
+}
+provider "aws" { region = "%%REGION%%" }
+
+locals { project = "%%PROJECT%%" }
+
+data "aws_vpc" "default" { default = true }
+data "aws_subnets" "default" {
+  filter { name = "vpc-id"  values = [data.aws_vpc.default.id] }
+}
+
+# ---- object store + task queue --------------------------------------------
+resource "aws_s3_bucket" "data" { bucket = "${local.project}-gleanflow-%%SUFFIX%%" }
+
+resource "aws_sqs_queue" "dlq" {
+  name                      = "${local.project}-tasks-dlq"
+  message_retention_seconds = 1209600
+}
+resource "aws_sqs_queue" "tasks" {
+  name                       = "${local.project}-tasks"
+  visibility_timeout_seconds = %%LEASE%%
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlq.arn
+    maxReceiveCount     = %%MAXREDELIVER%%
+  })
+}
+
+# ---- container registry ----------------------------------------------------
+resource "aws_ecr_repository" "img" {
+  name         = "${local.project}-gleanflow"
+  force_delete = true
+}
+
+# ---- IAM -------------------------------------------------------------------
+data "aws_iam_policy_document" "assume_ecs" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals { type = "Service" identifiers = ["ecs-tasks.amazonaws.com"] }
+  }
+}
+resource "aws_iam_role" "exec" {
+  name               = "${local.project}-gf-exec"
+  assume_role_policy = data.aws_iam_policy_document.assume_ecs.json
+}
+resource "aws_iam_role_policy_attachment" "exec_managed" {
+  role       = aws_iam_role.exec.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+resource "aws_iam_role" "job" {
+  name               = "${local.project}-gf-job"
+  assume_role_policy = data.aws_iam_policy_document.assume_ecs.json
+}
+data "aws_iam_policy_document" "job" {
+  statement {
+    actions   = ["s3:*"]
+    resources = [aws_s3_bucket.data.arn, "${aws_s3_bucket.data.arn}/*"]
+  }
+  statement {
+    actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:SendMessage",
+                 "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes"]
+    resources = [aws_sqs_queue.tasks.arn, aws_sqs_queue.dlq.arn]
+  }
+}
+resource "aws_iam_role_policy" "job" {
+  role   = aws_iam_role.job.id
+  policy = data.aws_iam_policy_document.job.json
+}
+
+data "aws_iam_policy_document" "assume_batch" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals { type = "Service" identifiers = ["batch.amazonaws.com"] }
+  }
+}
+resource "aws_iam_role" "batch" {
+  name               = "${local.project}-gf-batch"
+  assume_role_policy = data.aws_iam_policy_document.assume_batch.json
+}
+resource "aws_iam_role_policy_attachment" "batch_managed" {
+  role       = aws_iam_role.batch.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole"
+}
+
+# ---- AWS Batch: elastic Fargate-Spot compute, one generic worker job def ----
+resource "aws_security_group" "sg" {
+  name   = "${local.project}-gf-sg"
+  vpc_id = data.aws_vpc.default.id
+  egress { from_port = 0 to_port = 0 protocol = "-1" cidr_blocks = ["0.0.0.0/0"] }
+}
+resource "aws_batch_compute_environment" "ce" {
+  compute_environment_name = "${local.project}-gf-ce"
+  type                     = "MANAGED"
+  service_role             = aws_iam_role.batch.arn
+  compute_resources {
+    type               = "FARGATE_SPOT"
+    max_vcpus          = %%MAXVCPU%%
+    subnets            = data.aws_subnets.default.ids
+    security_group_ids = [aws_security_group.sg.id]
+  }
+}
+resource "aws_batch_job_queue" "q" {
+  name     = "${local.project}-gf-queue"
+  state    = "ENABLED"
+  priority = 1
+  compute_environment_order {
+    order               = 1
+    compute_environment = aws_batch_compute_environment.ce.arn
+  }
+}
+resource "aws_batch_job_definition" "worker" {
+  name                  = "${local.project}-gf-worker"
+  type                  = "container"
+  platform_capabilities = ["FARGATE"]
+  container_properties = jsonencode({
+    image      = "%%IMAGE%%"
+    command    = ["/entrypoint.sh"]
+    jobRoleArn       = aws_iam_role.job.arn
+    executionRoleArn = aws_iam_role.exec.arn
+    networkConfiguration = { assignPublicIp = "ENABLED" }
+    runtimePlatform      = { cpuArchitecture = "X86_64", operatingSystemFamily = "LINUX" }
+    fargatePlatformConfiguration = { platformVersion = "LATEST" }
+    resourceRequirements = [
+      { type = "VCPU",   value = "%%VCPU%%" },
+      { type = "MEMORY", value = "%%MEM%%" }
+    ]
+    environment = [
+      { name = "OUT_S3",  value = "s3://${aws_s3_bucket.data.bucket}" },
+      { name = "SQS_URL", value = aws_sqs_queue.tasks.url }
+    ]
+  })
+}
+
+output "s3_root"  { value = "s3://${aws_s3_bucket.data.bucket}" }
+output "queue"    { value = aws_batch_job_queue.q.arn }
+output "job_def"  { value = aws_batch_job_definition.worker.arn }
+output "sqs_url"  { value = aws_sqs_queue.tasks.url }
+output "dlq_url"  { value = aws_sqs_queue.dlq.url }
+output "ecr"      { value = aws_ecr_repository.img.repository_url }
