@@ -8,6 +8,7 @@ down. Terraform must be on PATH; everything else is created here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -25,7 +26,11 @@ def _render(pipe) -> str:
     cfg = pipe.config
     with open(os.path.join(_HERE, "main.tf.tmpl")) as f:
         tf = f.read()
-    suffix = str(abs(hash(pipe.name)) % 100000)
+    # deterministic across processes (builtin hash() is per-process randomized,
+    # which would rename the bucket on every render and force a destroy/recreate).
+    # ``bucket_suffix`` lets a deployment pin an existing bucket.
+    suffix = str(cfg.extra.get("bucket_suffix")
+                 or int(hashlib.sha1(pipe.name.encode()).hexdigest(), 16) % 100000)
     subs = {
         "%%PROJECT%%": pipe.name.replace("_", "-"),
         "%%REGION%%": cfg.region,

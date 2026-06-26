@@ -13,6 +13,12 @@ data "aws_subnets" "default" {
     name   = "vpc-id"
     values = [data.aws_vpc.default.id]
   }
+  # exclude Local Zone / Wavelength / Outpost subnets — Fargate runs only in
+  # standard AZs, and those are exactly the default-for-az subnets
+  filter {
+    name   = "default-for-az"
+    values = ["true"]
+  }
 }
 
 # ---- object store + task queue --------------------------------------------
