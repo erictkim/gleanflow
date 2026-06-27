@@ -46,6 +46,12 @@ class Controller:
         self.tracker = Tracker(run_id=f"{pipe.name}")
         self._viz_server = None
 
+        # LLM failure agent (opt-in via cfg.failure_policy)
+        self.handler = None
+        if self.cfg.failure_policy in ("report", "remediate"):
+            from .agent import default_agent
+            self.handler = self.cfg.failure_handler or default_agent()
+
     # ---- backend wiring ---------------------------------------------------
     def _make_queue_fleet(self):
         if self.backend == "local":
@@ -113,8 +119,8 @@ class Controller:
     def run(self, **run_args):
         if self.viz:
             from .web.server import start_server
-            self._viz_server = start_server(self.tracker, host=self.cfg.viz_host,
-                                            port=self.cfg.viz_port)
+            self._viz_server = start_server(self.tracker, store=self.store, pipe=self.pipe,
+                                            host=self.cfg.viz_host, port=self.cfg.viz_port)
             print(f"[viz] http://{self.cfg.viz_host}:{self.cfg.viz_port}", flush=True)
 
         # register the DAG (groups + edges) for the dashboard
@@ -157,39 +163,148 @@ class Controller:
             queue.enqueue(smoke_t)
             self.tracker.set_state(stage.name, smoke_t.key, TaskState.QUEUED)
             fleet.ensure(1)
-            self._wait([smoke_t], stage, queue, fleet, gate=True)
+            self._drain([smoke_t], stage, queue, fleet, gate=True)
             rest = pending[1:]
 
         for t in rest:
             queue.enqueue(t)
             self.tracker.set_state(stage.name, t.key, TaskState.QUEUED)
         fleet.ensure(min(self.max_workers, max(1, queue.depth())))
-        self._wait(rest, stage, queue, fleet, gate=False)
+        self._drain(rest, stage, queue, fleet, gate=False)
 
-    def _wait(self, tasks, stage, queue, fleet, *, gate: bool):
-        keys = {t.key for t in tasks}
+    def _drain(self, tasks, stage, queue, fleet, *, gate: bool):
+        """Wait for ``tasks`` to finish; on a dead-lettered chunk, invoke the agent
+        and (under budget) apply its remediation, growing/shrinking the active set."""
+        active = {t.key: t for t in tasks}
+        budget = self.cfg.max_remediations
         deadline = time.time() + 6 * 3600
         while time.time() < deadline:
-            # keep the fleet topped up to demand (independent of task count)
             depth = queue.depth()
             if depth:
                 fleet.ensure(min(self.max_workers, depth + fleet.running()))
-
             if self.backend != "local":
-                self._refresh_from_markers(stage, tasks)
+                self._refresh_from_markers(stage, list(active.values()))
 
-            done = sum(markers.has_result(self.store, k) for k in keys)
-            dead = [t for t in tasks if t in getattr(queue, "dlq", [])]
+            dlq = getattr(queue, "dlq", [])
+            dead = [active[t.key] for t in list(dlq) if t.key in active]
             if dead:
-                for t in dead:
-                    self.tracker.set_state(stage.name, t.key, TaskState.FAILED,
-                                           {"error": "max redeliveries -> DLQ"})
-                msg = f"{stage.name}: {len(dead)} chunk(s) dead-lettered"
-                raise SmokeFailed(msg) if gate else StageFailed(msg)
-            if done == len(keys):
+                new_tasks = self._handle_failures(stage, dead, queue, fleet, budget)
+                if new_tasks is None:
+                    msg = (f"{stage.name}: {len(dead)} chunk(s) failed"
+                           + ("" if self.handler else " (no failure agent configured)"))
+                    raise SmokeFailed(msg) if gate else StageFailed(msg)
+                budget -= 1
+                for d in dead:
+                    active.pop(d.key, None)
+                    try:
+                        dlq.remove(d)
+                    except ValueError:
+                        pass
+                for nt in new_tasks:
+                    active[nt.key] = nt
+                continue
+
+            if all(markers.has_result(self.store, k) for k in active):
                 return
-            time.sleep(0.1 if self.backend == "local" else 5.0)
-        raise StageFailed(f"{stage.name}: timed out waiting for {len(keys)} chunks")
+            time.sleep(0.05 if self.backend == "local" else 5.0)
+        raise StageFailed(f"{stage.name}: timed out waiting for {len(active)} chunks")
+
+    # ---- failure agent ----------------------------------------------------
+    def _handle_failures(self, stage, dead, queue, fleet, budget):
+        """Return new tasks to keep waiting on, or None to fail the stage."""
+        if self.handler is None:
+            return None
+        from .agent import DiagnosticTools, Remediation
+        tools = DiagnosticTools(self.store, self.pipe)
+        new: list = []
+        for t in dead:
+            self.tracker.set_state(stage.name, t.key, TaskState.FAILED,
+                                   {"error": "dead-lettered"})
+            event = self._failure_event(stage, t, tools)
+            rem = self.handler(event, tools) or Remediation("report")
+            print(f"[agent] {t.key}: action={rem.action} :: {rem.diagnosis} "
+                  f"-> {rem.fix}", flush=True)
+            if (self.cfg.failure_policy != "remediate" or budget <= 0
+                    or rem.action in ("report", "abort")):
+                return None
+            if rem.action == "retry_with":
+                new.append(self._retry_with(stage, t, rem, queue, fleet))
+            elif rem.action == "resplit":
+                new += self._resplit(stage, t, rem, queue, fleet)
+            elif rem.action == "skip":
+                self._skip(stage, t)
+            else:
+                return None
+        return new
+
+    def _failure_event(self, stage, task, tools):
+        from .agent import FailureEvent
+        f = {}
+        if markers.has_failure(self.store, task.key):
+            try:
+                f = markers.read_failure(self.store, task.key)
+            except Exception:
+                f = {}
+        peers = tools.peer_stats(stage.name)
+        return FailureEvent(
+            stage=stage.name, task_key=task.key, params=task.params, attempt=task.attempt,
+            error=f.get("error", ""), traceback=f.get("traceback", ""),
+            peak_mem_mb=f.get("peak_mem_mb"), limit_mb=f.get("limit_mb"),
+            cpu_seconds=f.get("cpu_seconds"),
+            members=task.params.get("_in", {}).get("members", []),
+            resources=f.get("resources") or stage.resources(self.cfg),
+            peer_peak_mem_mb=peers.get("max_peak_mem_mb"),
+        )
+
+    def _retry_with(self, stage, task, rem, queue, fleet):
+        # bump the fleet's worker resources (AWS); local backend has no per-task mem
+        if hasattr(fleet, "resources"):
+            if rem.mem:
+                fleet.resources["mem"] = rem.mem
+            if rem.vcpu:
+                fleet.resources["vcpu"] = rem.vcpu
+        task.attempt = 0
+        queue.enqueue(task)
+        self.tracker.set_state(stage.name, task.key, TaskState.QUEUED, {"retry": True})
+        return task
+
+    def _resplit(self, stage, parent, rem, queue, fleet):
+        members = parent.params.get("_in", {})
+        mlist = members.get("members", [])
+        if len(mlist) <= 1:
+            # nothing to split — fall back to a memory bump
+            from .agent import Remediation
+            return [self._retry_with(stage, parent, Remediation(
+                "retry_with", mem=((stage.resources(self.cfg)["mem"] * 2 + 4095) // 4096) * 4096),
+                queue, fleet)]
+        pid = parent.params["_chunk_id"]
+        subs = []
+        for j, m in enumerate(mlist):
+            sid = f"{pid}-m{j}"
+            p = {"_chunk_id": sid,
+                 "_in": {"kind": members["kind"], "name": members["name"], "members": [m]}}
+            subs.append(Task(stage=stage.name, key=f"{stage.name}/{sid}",
+                             params=p, weight=parent.weight / len(mlist)))
+        self._manifest_replace(stage.name, pid,
+                               [{"id": s.params["_chunk_id"], "params": {}, "weight": s.weight}
+                                for s in subs])
+        self.tracker.set_tasks(stage.name, [s.key for s in subs])
+        for s in subs:
+            queue.enqueue(s)
+            self.tracker.set_state(stage.name, s.key, TaskState.QUEUED,
+                                   {"resplit_of": parent.key})
+        return subs
+
+    def _skip(self, stage, task):
+        self.tracker.set_state(stage.name, task.key, TaskState.SKIPPED,
+                               {"skipped_by": "agent"})
+        self._manifest_replace(stage.name, task.params["_chunk_id"], [])
+
+    def _manifest_replace(self, stage_name, old_id, new_entries):
+        key = f"data/{stage_name}/_manifest.json"
+        m = json.loads(self.store.get_bytes(key).decode())
+        m["chunks"] = [c for c in m["chunks"] if c["id"] != old_id] + new_entries
+        self.store.put_bytes(key, json.dumps(m).encode())
 
     def _refresh_from_markers(self, stage, tasks):
         for t in tasks:

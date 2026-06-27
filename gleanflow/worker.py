@@ -69,13 +69,20 @@ def run_task(task: Task, *, queue, store, pipe, tracker=None, worker_id: str = "
               f"cpu={info.get('cpu_seconds')}s", flush=True)
         return True
     except Exception:
-        mon.stop()
+        stats = mon.stop()
         err = traceback.format_exc()
         print(f"FAIL {task.key}\n{err}", flush=True)
+        # persist the failure signal so the controller's agent can diagnose it
+        last = err.strip().splitlines()[-1][:300] if err.strip() else ""
+        markers.write_failure(store, task, {
+            "error": last, "traceback": err,
+            "peak_mem_mb": stats.get("peak_mem_mb"), "limit_mb": stats.get("limit_mb"),
+            "cpu_seconds": stats.get("cpu_seconds"),
+            "resources": stage.resources(pipe.config),
+        })
         markers.clear_running(store, task.key)
         if tracker:
-            tracker.set_state(task.stage, task.key, TaskState.FAILED,
-                              {"error": err.splitlines()[-1][:300]})
+            tracker.set_state(task.stage, task.key, TaskState.FAILED, {"error": last})
         queue.fail(task)
         return False
     finally:

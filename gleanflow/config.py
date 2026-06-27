@@ -42,6 +42,11 @@ class PipelineConfig:
     viz_host: str = "127.0.0.1"
     viz_port: int = 8765
 
+    # --- LLM failure agent --------------------------------------------------
+    failure_policy: str = "off"        # "off" | "report" | "remediate"
+    failure_handler: object = None     # FailureHandler callable; default agent if None
+    max_remediations: int = 2          # cap on auto-fixes per stage
+
     # arbitrary extra knobs a user pipeline may read
     extra: dict = field(default_factory=dict)
 

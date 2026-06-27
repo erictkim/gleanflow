@@ -22,6 +22,10 @@ def running_key(task_key: str) -> str:
     return f"running/{task_key}.json"
 
 
+def failure_key(task_key: str) -> str:
+    return f"failures/{task_key}.json"
+
+
 def has_result(store: Store, task_key: str) -> bool:
     return store.exists(result_key(task_key))
 
@@ -43,6 +47,39 @@ def write_result(store: Store, task, info: dict) -> None:
         "attempt": task.attempt,
     }
     store.put_bytes(result_key(task.key), json.dumps(body).encode())
+
+
+def has_failure(store: Store, task_key: str) -> bool:
+    return store.exists(failure_key(task_key))
+
+
+def read_failure(store: Store, task_key: str) -> dict:
+    return json.loads(store.get_bytes(failure_key(task_key)).decode())
+
+
+def list_failures(store: Store, stage: str) -> list[str]:
+    out = []
+    for k in store.list(f"failures/{stage}/"):
+        if k.endswith(".json"):
+            out.append(k[len("failures/"):-len(".json")])
+    return out
+
+
+def write_failure(store: Store, task, info: dict) -> None:
+    body = {
+        "job_key": task.key,
+        "stage": task.stage,
+        "params": task.params,
+        "ts": info.get("ts", _now()),
+        "attempt": task.attempt,
+        "error": info.get("error", ""),
+        "traceback": info.get("traceback", ""),
+        "peak_mem_mb": info.get("peak_mem_mb"),
+        "limit_mb": info.get("limit_mb"),
+        "cpu_seconds": info.get("cpu_seconds"),
+        "resources": info.get("resources", {}),
+    }
+    store.put_bytes(failure_key(task.key), json.dumps(body).encode())
 
 
 def write_running(store: Store, task, worker_id: str) -> None:

@@ -17,6 +17,8 @@ with zero AWS, then flip ``backend="aws"`` unchanged.
     pipe.run(backend="local", viz=True)
 """
 
+from .agent import (DiagnosticTools, FailureEvent, LLMFailureAgent, Remediation,
+                    default_agent)
 from .config import PipelineConfig
 from .context import Ctx
 from .partition import Chunk
@@ -27,6 +29,7 @@ from .task import Task, TaskState
 __all__ = [
     "Pipeline", "PipelineConfig", "Source", "Stage", "Ctx",
     "Chunk", "Task", "TaskState",
+    "FailureEvent", "Remediation", "DiagnosticTools", "LLMFailureAgent", "default_agent",
 ]
 
 __version__ = "0.1.0"

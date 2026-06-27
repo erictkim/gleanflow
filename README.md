@@ -69,6 +69,30 @@ groupby_agg(pipe, "by_user", source=src, by="user",
             target_bytes=512_000_000)   # pack ~512MB of files per map task
 ```
 
+## LLM failure agent
+
+When a chunk dead-letters, gleanflow can hand the failure to an agent that diagnoses
+and (bounded) fixes it. The pipeline already persists everything the agent needs:
+`failures/<key>.json` (traceback + peak-mem vs limit + resources), healthy-peer stats,
+and the stage source.
+
+```python
+PipelineConfig(
+    failure_policy="remediate",   # "off" | "report" | "remediate"
+    max_remediations=2,           # cap on auto-fixes per stage
+    # failure_handler=...         # default: LLMFailureAgent (claude CLI + heuristic)
+)
+```
+
+The agent returns a `Remediation` the controller applies: **resplit** an oversized
+packed chunk into per-partition tasks (updates the manifest so downstream follows),
+**retry_with** more memory, **skip**, or **abort** with a written diagnosis. The LLM is
+pluggable — pass any `complete(prompt) -> str`; the default shells out to the `claude`
+CLI (your existing auth), and a deterministic OOM heuristic runs if no LLM is reachable.
+
+The viz server also exposes a **local query API** the agent (or you) can curl:
+`/api/state`, `/api/failures`, `/api/task?key=<stage/chunk>`, `/api/stage?name=<stage>`.
+
 ## Visualization
 
 `pipe.run(viz=True)` (or `--viz`) starts a local dashboard at
