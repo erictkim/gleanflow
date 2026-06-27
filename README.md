@@ -7,6 +7,15 @@ You write a DAG of stages as plain Python functions. gleanflow decouples that
 staging, a leased task queue, a self-scaling worker fleet, OOM telemetry, and
 resumable runs. Run it locally with zero AWS, then flip one flag to run it on Batch.
 
+- **Decoupled** — tasks (data on a queue) vs compute (a worker fleet); one Batch job
+  drains many tasks, the fleet scales on queue depth, not task count.
+- **OOM-proof** — size-targeted chunking, heaviest-first smoke gate, per-stage memory,
+  streamed writes, resumable checkpoints.
+- **Resumable** — S3 completion markers skip already-done chunks on re-run.
+- **Polars map→reduce** — split a lazy query over many files into map + reduce tasks.
+- **Self-healing** — an LLM agent diagnoses failures and (bounded) re-splits / retries.
+- **Observable** — live local dashboard, a query API, and push (callback/SSE) updates.
+
 ```python
 from gleanflow import Pipeline, PipelineConfig
 
@@ -145,21 +154,26 @@ gleanflow/
   partition.py store.py markers.py    # chunking, object store, completion markers
   task.py queue/                      # task plane (leased queue: local + sqs)
   worker.py fleet/                    # compute plane (poll loop + local/batch fleet)
-  controller.py tracker.py            # control plane + live state for viz
+  controller.py tracker.py            # control plane + live state + event pub/sub
   monitor.py ckpt.py                  # OOM telemetry, resumable fit
-  web/                                # local dashboard (stdlib http.server + vanilla JS)
+  polars.py                           # polars map→reduce (parquet_source/groupby_agg)
+  agent.py                            # LLM failure agent + Investigator (claude triage)
+  web/                                # dashboard + query API + push (webhook/SSE)
   infra/                              # Terraform + Dockerfile + entrypoint
-examples/zz/pipeline.py               # runnable fan-out/fan-in demo
-tests/                                # local-backend e2e + queue/packer units
+examples/zz/pipeline.py               # fan-out/fan-in demo
+examples/polars_demo.py               # prints how a lazy query chunks into map→reduce
+awsdemo/                              # self-contained pipeline for a real Batch run
+tests/                                # local-backend e2e + units (no AWS required)
 ```
 
 ## Test
 
 ```
 pip install -e .[dev]
-pytest
+pytest          # 23 tests, all on the local backend — no AWS
 ```
 
 Covers: end-to-end local run, `workers=1` finishing all tasks (one worker, many
 tasks), worker-count-independent results, marker-based resume/skip, smoke-gate abort,
-and queue lease/redelivery/DLQ.
+queue lease/redelivery/DLQ, polars map→reduce vs single-shot, agent resplit
+auto-recovery, the triage API, and push (callback/webhook/SSE) delivery.
