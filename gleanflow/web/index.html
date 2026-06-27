@@ -40,12 +40,27 @@
   .meta { color:var(--muted); margin-top:8px; font-size:11px; display:flex; gap:10px; flex-wrap:wrap; }
   .meta b { color:var(--ink); font-weight:600; }
   .dot { font-size:10px; }
+  #askbtn { background:#1e293b; color:var(--ink); border:1px solid var(--edge);
+            border-radius:6px; padding:5px 11px; cursor:pointer; font:inherit; }
+  #askbtn:hover { border-color:var(--running); }
+  .cell { cursor:pointer; }
+  #panel { position:fixed; right:16px; bottom:16px; width:540px; max-height:58vh;
+           overflow:auto; background:var(--panel); border:1px solid var(--edge);
+           border-radius:10px; box-shadow:0 10px 32px rgba(0,0,0,.55); z-index:20; }
+  #panel.hidden { display:none; }
+  #panel .ptitle { display:flex; justify-content:space-between; gap:10px; padding:9px 12px;
+                   border-bottom:1px solid var(--edge); color:var(--running);
+                   position:sticky; top:0; background:var(--panel); }
+  #panel #pclose { cursor:pointer; color:var(--muted); }
+  #panel pre { margin:0; padding:12px; white-space:pre-wrap; word-break:break-word;
+               font-size:12px; color:var(--ink); }
 </style>
 </head>
 <body>
 <header>
   <h1><b>gleanflow</b> <span id="run"></span></h1>
   <span class="totals" id="totals"></span>
+  <button id="askbtn" title="ask Claude to check the run">Check run ▶</button>
   <div class="legend">
     <span><i class="sw" style="background:var(--pending)"></i>pending</span>
     <span><i class="sw" style="background:var(--queued)"></i>queued</span>
@@ -59,6 +74,7 @@
   <svg id="edges"></svg>
   <div id="graph"></div>
 </div>
+<div id="panel" class="hidden"></div>
 <script>
 const STATES = ["pending","queued","running","success","failed","skipped"];
 const COLORS = {pending:"#475569",queued:"#f59e0b",running:"#3b82f6",
@@ -108,7 +124,8 @@ function render(state){
       s.tasks.forEach(t=>{
         const c=document.createElement("div");
         c.className="cell "+t.state; c.id="c-"+s.name+"-"+t.key;
-        c.title=t.key; cells.appendChild(c);
+        c.title=t.key+"  ("+t.state+")  — click for details";
+        c.onclick=()=>cellClick(t); cells.appendChild(c);
       });
     });
   }
@@ -175,6 +192,32 @@ async function tick(){
     render(await r.json());
   }catch(e){ /* server gone */ }
 }
+// --- Claude Code triage (POST endpoints; require enable_agent_api) -----------
+function showPanel(title, body){
+  const p=document.getElementById("panel"); p.classList.remove("hidden");
+  p.innerHTML=`<div class="ptitle"><span>${title}</span><span id="pclose">✕</span></div><pre>${body}</pre>`;
+  document.getElementById("pclose").onclick=()=>p.classList.add("hidden");
+}
+async function post(path){ const r=await fetch(path,{method:"POST"}); return r.json(); }
+async function diagnose(key){
+  showPanel("🔍 diagnose "+key, "asking Claude…");
+  try{ const d=await post("/api/diagnose?key="+encodeURIComponent(key));
+       showPanel("🔍 diagnose "+key, JSON.stringify(d,null,2)); }
+  catch(e){ showPanel(key, "error: "+e); }
+}
+async function showTask(key){
+  try{ const r=await fetch("/api/task?key="+encodeURIComponent(key));
+       showPanel(key, JSON.stringify(await r.json(),null,2)); }
+  catch(e){ showPanel(key, "error: "+e); }
+}
+function cellClick(t){ t.state==="failed" ? diagnose(t.key) : showTask(t.key); }
+document.getElementById("askbtn").onclick=async()=>{
+  showPanel("run health", "asking Claude…");
+  try{ const d=await post("/api/check");
+       showPanel("run health", (d.summary||"")+"\n\n"+(d.verdict||d.error||"")); }
+  catch(e){ showPanel("run health", "error: "+e); }
+};
+
 tick(); setInterval(tick, 500);
 window.addEventListener("resize", ()=>fetch("/api/state").then(r=>r.json()).then(s=>drawEdges(s,levels(s.stages))));
 </script>

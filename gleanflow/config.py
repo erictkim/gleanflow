@@ -46,6 +46,9 @@ class PipelineConfig:
     failure_policy: str = "off"        # "off" | "report" | "remediate"
     failure_handler: object = None     # FailureHandler callable; default agent if None
     max_remediations: int = 2          # cap on auto-fixes per stage
+    # opt-in: let the local viz server spawn a `claude -p` session on request
+    # (/api/diagnose, /api/ask, /api/check). Local-only; spawns a subprocess.
+    enable_agent_api: bool = False
 
     # arbitrary extra knobs a user pipeline may read
     extra: dict = field(default_factory=dict)

@@ -207,3 +207,67 @@ def _heuristic(event: FailureEvent) -> Remediation:
 def default_agent() -> LLMFailureAgent:
     """The bounded-auto-remediate agent: claude CLI + stdout, heuristic fallback."""
     return LLMFailureAgent()
+
+
+# ---------------------------------------------------------------------------
+# Investigator — lets the webserver call a Claude Code session on demand
+# ---------------------------------------------------------------------------
+class Investigator:
+    """On-demand triage the local viz server exposes over HTTP.
+
+    Each method gathers run context from the object store and shells out to a Claude
+    Code session (``claude -p``), so a dashboard button (or a curl) can ask Claude to
+    check why a chunk failed, or whether the whole run looks healthy.
+    """
+
+    def __init__(self, store, pipe, *, complete: Optional[Callable[[str], str]] = None):
+        self.store = store
+        self.pipe = pipe
+        self.tools = DiagnosticTools(store, pipe)
+        self.complete = complete or claude_cli_complete
+
+    def diagnose(self, key: str) -> dict:
+        """Run the failure agent on one failed chunk -> structured remediation."""
+        from . import markers
+        f = markers.read_failure(self.store, key) if markers.has_failure(self.store, key) else {}
+        stage = key.split("/", 1)[0]
+        peers = self.tools.peer_stats(stage)
+        event = FailureEvent(
+            stage=stage, task_key=key, params=f.get("params", {}), attempt=f.get("attempt", 0),
+            error=f.get("error", ""), traceback=f.get("traceback", ""),
+            peak_mem_mb=f.get("peak_mem_mb"), limit_mb=f.get("limit_mb"),
+            cpu_seconds=f.get("cpu_seconds"),
+            members=f.get("params", {}).get("_in", {}).get("members", []),
+            resources=f.get("resources", {}), peer_peak_mem_mb=peers.get("max_peak_mem_mb"),
+        )
+        agent = LLMFailureAgent(complete=self.complete, notify=lambda m: None)
+        rem = agent(event, self.tools)
+        return {"key": key, "action": rem.action, "diagnosis": rem.diagnosis,
+                "fix": rem.fix, "mem": rem.mem, "vcpu": rem.vcpu}
+
+    def ask(self, question: str, key: Optional[str] = None) -> dict:
+        """Free-form question to Claude about a task (or the run)."""
+        return {"answer": self.complete(f"{question}\n\nRun context:\n{self._context(key)}")}
+
+    def check_run(self) -> dict:
+        """Ask Claude whether the run looks healthy (per-stage success/failure/OOM)."""
+        lines = []
+        for st in self.pipe.topo_order():
+            done = len([k for k in self.store.list(f"results/{st.name}/") if k.endswith(".json")])
+            fails = len(self.tools.list_failures(st.name))
+            peak = self.tools.peer_stats(st.name).get("max_peak_mem_mb")
+            lines.append(f"{st.name}: {done} done, {fails} failed, peak_mem={peak}MB")
+        summary = "\n".join(lines)
+        prompt = ("Pipeline run summary below. Did it succeed? Flag any stage that failed "
+                  "or ran near its memory limit, and suggest next steps.\n\n" + summary)
+        return {"summary": summary, "verdict": self.complete(prompt)}
+
+    def _context(self, key: Optional[str]) -> str:
+        from . import markers
+        if not key:
+            return ""
+        if markers.has_failure(self.store, key):
+            return json.dumps(markers.read_failure(self.store, key))[:3000]
+        if markers.has_result(self.store, key):
+            return json.dumps(markers.read_result(self.store, key))[:3000]
+        return ""

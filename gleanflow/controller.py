@@ -119,7 +119,12 @@ class Controller:
     def run(self, **run_args):
         if self.viz:
             from .web.server import start_server
+            investigator = None
+            if self.cfg.enable_agent_api:
+                from .agent import Investigator
+                investigator = Investigator(self.store, self.pipe)
             self._viz_server = start_server(self.tracker, store=self.store, pipe=self.pipe,
+                                            investigator=investigator,
                                             host=self.cfg.viz_host, port=self.cfg.viz_port)
             print(f"[viz] http://{self.cfg.viz_host}:{self.cfg.viz_port}", flush=True)
 

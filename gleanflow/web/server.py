@@ -29,8 +29,15 @@ def _index_html() -> bytes:
         return f.read()
 
 
-def start_server(tracker, *, store=None, pipe=None, host: str = "127.0.0.1", port: int = 8765):
-    """Start the dashboard + query API in a daemon thread. Returns the HTTPServer."""
+def start_server(tracker, *, store=None, pipe=None, investigator=None,
+                 host: str = "127.0.0.1", port: int = 8765):
+    """Start the dashboard + query API in a daemon thread. Returns the HTTPServer.
+
+    If ``investigator`` is provided, POST endpoints spawn a Claude Code session:
+        POST /api/diagnose?key=<stage/chunk>   -> structured remediation
+        POST /api/ask        {question, key}   -> free-form answer
+        POST /api/check                        -> run health verdict
+    """
 
     def _failures() -> list:
         from .. import markers
@@ -103,6 +110,27 @@ def start_server(tracker, *, store=None, pipe=None, host: str = "127.0.0.1", por
                 self._json(_stage(q.get("name", [""])[0]))
             else:
                 self._send(404, b"not found", "text/plain")
+
+        def do_POST(self):
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            if investigator is None:
+                self._send(503, b'{"error":"agent api disabled (enable_agent_api)"}',
+                           "application/json")
+                return
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            try:
+                if u.path == "/api/diagnose":
+                    self._json(investigator.diagnose(q.get("key", [body.get("key", "")])[0]))
+                elif u.path == "/api/ask":
+                    self._json(investigator.ask(body.get("question", ""), body.get("key")))
+                elif u.path == "/api/check":
+                    self._json(investigator.check_run())
+                else:
+                    self._send(404, b"not found", "text/plain")
+            except Exception as e:  # never let a triage call crash the server
+                self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
 
     httpd = ThreadingHTTPServer((host, port), Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()

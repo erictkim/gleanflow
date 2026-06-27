@@ -93,6 +93,13 @@ CLI (your existing auth), and a deterministic OOM heuristic runs if no LLM is re
 The viz server also exposes a **local query API** the agent (or you) can curl:
 `/api/state`, `/api/failures`, `/api/task?key=<stage/chunk>`, `/api/stage?name=<stage>`.
 
+**The webserver can also call Claude back.** With `enable_agent_api=True`, POST
+endpoints spawn a `claude -p` session on demand against the run's context:
+`POST /api/diagnose?key=<stage/chunk>` (root-cause + suggested fix),
+`POST /api/ask {question, key}`, `POST /api/check` (whole-run health verdict). The
+dashboard wires these up — a **Check run ▶** button and click-a-failed-square-to-diagnose.
+Local-only and opt-in, since it spawns a subprocess from an HTTP request.
+
 ## Visualization
 
 `pipe.run(viz=True)` (or `--viz`) starts a local dashboard at
