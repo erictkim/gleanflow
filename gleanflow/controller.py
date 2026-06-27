@@ -34,7 +34,7 @@ class StageFailed(RuntimeError):
 
 class Controller:
     def __init__(self, pipe, *, backend="local", workers=None, viz=False,
-                 force=False, smoke=True):
+                 force=False, smoke=True, on_event=None):
         self.pipe = pipe
         self.cfg = pipe.config
         self.backend = backend
@@ -44,6 +44,8 @@ class Controller:
         self.smoke = smoke
         self.store = store_from_config(self.cfg)
         self.tracker = Tracker(run_id=f"{pipe.name}")
+        if on_event is not None:                 # in-process push callback
+            self.tracker.subscribe(on_event)
         self._viz_server = None
 
         # LLM failure agent (opt-in via cfg.failure_policy)
@@ -137,9 +139,15 @@ class Controller:
         try:
             for st in order:
                 self._run_stage(st, queue, fleet, run_args)
+                self.tracker.emit({"type": "stage_done", "stage": st.name,
+                                   "counts": self.tracker.counts(st.name), "ts": time.time()})
+        except Exception as e:
+            self.tracker.emit({"type": "run_failed", "error": str(e), "ts": time.time()})
+            raise
         finally:
             if self.backend == "local":
                 fleet.drain()
+        self.tracker.emit({"type": "run_done", "run_id": self.pipe.name, "ts": time.time()})
         print(f"[done] pipeline {self.pipe.name}", flush=True)
         if self._viz_server is not None and run_args.get("hold_viz", True):
             self._hold_viz()

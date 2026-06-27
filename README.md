@@ -93,6 +93,16 @@ CLI (your existing auth), and a deterministic OOM heuristic runs if no LLM is re
 The viz server also exposes a **local query API** the agent (or you) can curl:
 `/api/state`, `/api/failures`, `/api/task?key=<stage/chunk>`, `/api/stage?name=<stage>`.
 
+**Push, not poll.** Subscribe to status updates instead of polling:
+- in-process — `pipe.run(on_event=fn)` calls `fn(event)` on every task transition,
+  `stage_done`, and `run_done`;
+- webhook — `POST /api/subscribe {url, events?}` registers a callback URL the server
+  POSTs each event to (optionally filtered, e.g. `["failed","run_done"]`);
+- stream — `GET /api/events?events=failed,run_done` is a Server-Sent-Events feed.
+
+So Claude Code (or any client) can register a callback and be notified the moment a
+chunk fails or the run finishes, rather than polling `/api/state`.
+
 **The webserver can also call Claude back.** With `enable_agent_api=True`, POST
 endpoints spawn a `claude -p` session on demand against the run's context:
 `POST /api/diagnose?key=<stage/chunk>` (root-cause + suggested fix),

@@ -97,7 +97,10 @@ class Pipeline:
 
     # ---- execution --------------------------------------------------------
     def run(self, backend: str = "local", *, workers: Optional[int] = None,
-            viz: bool = False, force: bool = False, smoke: bool = True, **run_args):
+            viz: bool = False, force: bool = False, smoke: bool = True,
+            on_event=None, **run_args):
+        """Run the pipeline. ``on_event(event)`` is an in-process push callback
+        invoked on every status change (task transition, stage_done, run_done)."""
         from .controller import Controller
         return Controller(self, backend=backend, workers=workers, viz=viz,
-                          force=force, smoke=smoke).run(**run_args)
+                          force=force, smoke=smoke, on_event=on_event).run(**run_args)

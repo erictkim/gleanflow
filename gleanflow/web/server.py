@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import json
 import os
+import queue as _queue
 import threading
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -80,9 +82,70 @@ def start_server(tracker, *, store=None, pipe=None, investigator=None,
                 d["source"] = ""
         return d
 
+    # ---- push: webhooks + SSE, fed by a dispatcher subscribed to the tracker ---
+    webhooks: dict = {}            # id -> {"url", "events": set|None}
+    sse_queues: list = []          # [(Queue, filter_set|None)]
+    _ids = [0]
+    _evq: "_queue.Queue" = _queue.Queue()
+
+    def _match(ev, flt):
+        return flt is None or bool({ev.get("state"), ev.get("type")} & flt)
+
+    def _dispatch():
+        while True:
+            ev = _evq.get()
+            for wid, wh in list(webhooks.items()):
+                if not _match(ev, wh["events"]):
+                    continue
+                try:
+                    req = urllib.request.Request(
+                        wh["url"], data=json.dumps(ev).encode(),
+                        headers={"Content-Type": "application/json"}, method="POST")
+                    urllib.request.urlopen(req, timeout=5)
+                except Exception:
+                    pass
+            for q, flt in list(sse_queues):
+                if _match(ev, flt):
+                    try:
+                        q.put_nowait(ev)
+                    except Exception:
+                        pass
+
+    if hasattr(tracker, "subscribe"):
+        tracker.subscribe(lambda ev: _evq.put(ev))
+        threading.Thread(target=_dispatch, daemon=True).start()
+
+    def _subscribe(body):
+        wid = str(_ids[0]); _ids[0] += 1
+        evs = body.get("events")
+        webhooks[wid] = {"url": body["url"], "events": set(evs) if evs else None}
+        return {"id": wid, "url": body["url"], "events": evs}
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
+
+        def _sse(self, flt):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            q = _queue.Queue()
+            sse_queues.append((q, flt))
+            try:
+                self.wfile.write(b": connected\n\n")
+                self.wfile.flush()
+                while True:
+                    try:
+                        ev = q.get(timeout=15)
+                        self.wfile.write(f"data: {json.dumps(ev)}\n\n".encode())
+                    except _queue.Empty:
+                        self.wfile.write(b": keepalive\n\n")   # also detects disconnect
+                    self.wfile.flush()
+            except Exception:
+                pass
+            finally:
+                sse_queues.remove((q, flt))
 
         def _send(self, code, body, ctype):
             self.send_response(code)
@@ -108,18 +171,34 @@ def start_server(tracker, *, store=None, pipe=None, investigator=None,
                 self._json(_task(q.get("key", [""])[0]))
             elif u.path == "/api/stage":
                 self._json(_stage(q.get("name", [""])[0]))
+            elif u.path == "/api/events":                      # SSE push stream
+                flt = set(q.get("events", [""])[0].split(",")) - {""}
+                self._sse(flt or None)
+            elif u.path == "/api/subscriptions":
+                self._json([{"id": k, "url": v["url"],
+                             "events": list(v["events"]) if v["events"] else None}
+                            for k, v in webhooks.items()])
             else:
                 self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
             u = urlparse(self.path)
             q = parse_qs(u.query)
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            # --- notification subscriptions (no LLM needed) ---
+            if u.path == "/api/subscribe":
+                self._json(_subscribe(body))
+                return
+            if u.path == "/api/unsubscribe":
+                webhooks.pop(body.get("id", ""), None)
+                self._json({"ok": True})
+                return
+            # --- LLM triage (opt-in) ---
             if investigator is None:
                 self._send(503, b'{"error":"agent api disabled (enable_agent_api)"}',
                            "application/json")
                 return
-            n = int(self.headers.get("Content-Length", 0) or 0)
-            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
             try:
                 if u.path == "/api/diagnose":
                     self._json(investigator.diagnose(q.get("key", [body.get("key", "")])[0]))
