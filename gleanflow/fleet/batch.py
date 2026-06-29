@@ -29,16 +29,24 @@ class BatchFleet:
 
     # ---- runtime code delivery -------------------------------------------
     def deliver_code(self, package_dir: str) -> str:
-        """Zip the user package, content-hash it, upload to APPCODE_S3, return the key."""
+        """Zip the user code, content-hash it, upload to APPCODE_S3, return the key.
+
+        Layout depends on the pipeline spec's module: a dotted module (``pkg.mod:attr``) is a
+        package, so arcnames keep the ``pkg/`` prefix (relpath from the parent); a top-level
+        module (``mod:attr``) is flat, so the dir's contents go at the zip root. Either way the
+        entrypoint puts the unzip dir on PYTHONPATH, so ``import <module>`` resolves."""
         from ..store import store_from_config
+        mod = self.spec.split(":", 1)[0]
+        base = os.path.dirname(package_dir) if "." in mod else package_dir   # package vs flat layout
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            for root, _, files in os.walk(package_dir):
+            for root, dirs, files in os.walk(package_dir):   # followlinks=False: symlinked data/ dirs skipped
+                dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]  # prune .git/.venv/...
                 for f in files:
-                    if f.endswith((".pyc",)) or "__pycache__" in root:
+                    if f.endswith((".pyc",)) or f.endswith((".log",)):
                         continue
                     full = os.path.join(root, f)
-                    z.write(full, os.path.relpath(full, os.path.dirname(package_dir)))
+                    z.write(full, os.path.relpath(full, base))
         data = buf.getvalue()
         sha = hashlib.sha1(data).hexdigest()[:12]
         store = store_from_config(self.cfg)
@@ -88,6 +96,29 @@ class BatchFleet:
                 if j["status"] in ("SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING"):
                     live += 1
         return live
+
+    def _failed_jobs(self) -> list:
+        out = []
+        for i in range(0, len(self._job_ids), 100):
+            for j in self.batch.describe_jobs(jobs=self._job_ids[i:i + 100])["jobs"]:
+                if j["status"] == "FAILED":
+                    out.append(j)
+        return out
+
+    def failed_count(self) -> int:
+        """Worker jobs that terminated FAILED — a crash-loop signal (they die before claiming a task,
+        so no DLQ entry ever appears and the run would otherwise hang)."""
+        return len(self._failed_jobs()) if self._job_ids else 0
+
+    def last_failure(self) -> dict | None:
+        best = None
+        for j in self._failed_jobs():
+            ts = j.get("stoppedAt") or 0
+            if best is None or ts >= best[0]:
+                c = (j.get("attempts") or [{}])[-1].get("container", {})
+                best = (ts, {"jobId": j["jobId"], "reason": j.get("statusReason"),
+                             "exitCode": c.get("exitCode"), "logStreamName": c.get("logStreamName")})
+        return best[1] if best else None
 
     def drain(self) -> None:
         # workers self-terminate on idle; nothing to actively kill

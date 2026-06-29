@@ -143,6 +143,11 @@ class Controller:
                                    "counts": self.tracker.counts(st.name), "ts": time.time()})
         except Exception as e:
             self.tracker.emit({"type": "run_failed", "error": str(e), "ts": time.time()})
+            # hold the dashboard open on FAILURE too, so the run_failed event is delivered to
+            # SSE/webhook subscribers and the failure is inspectable (else the server dies with run()).
+            if self._viz_server is not None and run_args.get("hold_viz", True):
+                print(f"[viz] run FAILED ({e}) — holding dashboard open (Ctrl-C to exit)", flush=True)
+                self._hold_viz()
             raise
         finally:
             if self.backend == "local":
@@ -217,8 +222,23 @@ class Controller:
                     active[nt.key] = nt
                 continue
 
-            if all(markers.has_result(self.store, k) for k in active):
+            done = [k for k in active if markers.has_result(self.store, k)]
+            if len(done) == len(active):
                 return
+
+            # crash-loop guard: workers that die before claiming a task never hit the DLQ, so the
+            # run would hang. If many worker jobs have FAILED and not one task has completed, abort.
+            if self.backend != "local" and not done:
+                nfail = fleet.failed_count()
+                if nfail >= self.cfg.worker_failure_cap:
+                    info = fleet.last_failure() or {}
+                    msg = (f"{stage.name}: workers dying repeatedly — {nfail} worker jobs FAILED, "
+                           f"0 tasks completed (exit={info.get('exitCode')} "
+                           f"reason={info.get('reason')!r} log={info.get('logStreamName')}). "
+                           f"Likely a bad worker image or startup error — check that log stream.")
+                    self.tracker.emit({"type": "workers_dying", "stage": stage.name,
+                                       "failed": nfail, "last": info, "ts": time.time()})
+                    raise SmokeFailed(msg) if gate else StageFailed(msg)
             time.sleep(0.05 if self.backend == "local" else 5.0)
         raise StageFailed(f"{stage.name}: timed out waiting for {len(active)} chunks")
 

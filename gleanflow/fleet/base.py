@@ -22,3 +22,15 @@ class Fleet:
     def drain(self) -> None:
         """Signal workers to finish current task and stop; block until stopped."""
         ...
+
+    def failed_count(self) -> int:
+        """How many worker jobs this fleet submitted have terminated as FAILED.
+
+        Used by the controller to catch a crash-loop: workers dying (e.g. a bad image
+        or import) before they ever claim a task never produce DLQ entries, so the run
+        would otherwise hang. Default 0 (e.g. the local thread fleet doesn't fail)."""
+        return 0
+
+    def last_failure(self) -> dict | None:
+        """Diagnostics for the most recent failed worker job (exitCode / reason / log), or None."""
+        return None

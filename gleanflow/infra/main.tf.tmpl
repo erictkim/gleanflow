@@ -5,7 +5,10 @@ terraform {
 }
 provider "aws" { region = "%%REGION%%" }
 
-locals { project = "%%PROJECT%%" }
+locals {
+  project   = "%%PROJECT%%"
+  read_arns = %%READ_ARNS%%   # extra read-only bucket ARNs the worker job role may GET/LIST (cfg.extra["read_buckets"])
+}
 
 data "aws_vpc" "default" { default = true }
 data "aws_subnets" "default" {
@@ -43,6 +46,116 @@ resource "aws_ecr_repository" "img" {
   force_delete = true
 }
 
+# ---- in-cloud image build (CodeBuild, no local docker) ---------------------
+# Builds ONE generic worker image = gleanflow core + baked deps (+ EXTRA_PIP). The pipeline's own
+# code ships at runtime via APPCODE_S3, so the image needs NO rebuild for code changes; the build
+# only re-runs when its context hash (Dockerfile / entrypoint / gleanflow source / EXTRA_PIP) changes.
+data "aws_iam_policy_document" "assume_codebuild" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["codebuild.amazonaws.com"]
+    }
+  }
+}
+resource "aws_iam_role" "codebuild" {
+  name               = "${local.project}-gf-codebuild"
+  assume_role_policy = data.aws_iam_policy_document.assume_codebuild.json
+}
+resource "aws_iam_role_policy" "codebuild" {
+  role = aws_iam_role.codebuild.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Effect = "Allow", Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], Resource = "*" },
+      { Effect = "Allow", Action = ["ecr:GetAuthorizationToken"], Resource = "*" },
+      { Effect = "Allow",
+        Action = ["ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload", "ecr:PutImage", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"],
+        Resource = aws_ecr_repository.img.arn },
+      { Effect = "Allow", Action = ["s3:GetObject"], Resource = "${aws_s3_bucket.data.arn}/codebuild-src/*" }
+    ]
+  })
+}
+resource "aws_codebuild_project" "img" {
+  name         = "${local.project}-gf-build"
+  service_role = aws_iam_role.codebuild.arn
+  artifacts { type = "NO_ARTIFACTS" }
+  environment {
+    type            = "ARM_CONTAINER"                                   # invest-zigzag template: ARM64
+    image           = "aws/codebuild/amazonlinux2-aarch64-standard:3.0"
+    compute_type    = "BUILD_GENERAL1_MEDIUM"
+    privileged_mode = true
+    environment_variable {
+      name  = "ECR_URL"
+      value = aws_ecr_repository.img.repository_url
+    }
+    environment_variable {
+      name  = "EXTRA_PIP"
+      value = "%%EXTRA_PIP%%"
+    }
+    environment_variable {
+      name  = "DOCKER_BUILDKIT"
+      value = "0"
+    }
+  }
+  source {
+    type      = "S3"
+    location  = "${aws_s3_bucket.data.bucket}/codebuild-src/context.zip"
+    buildspec = <<-BUILDSPEC
+      version: 0.2
+      phases:
+        pre_build:
+          commands:
+            - aws ecr get-login-password --region %%REGION%% | docker login --username AWS --password-stdin "$${ECR_URL%%/*}"
+        build:
+          commands:
+            - docker pull "$ECR_URL:latest" || true
+            - docker build --platform linux/arm64 --cache-from "$ECR_URL:latest" --build-arg EXTRA_PIP="$EXTRA_PIP" -t "$ECR_URL:latest" .
+        post_build:
+          commands:
+            - docker push "$ECR_URL:latest"
+    BUILDSPEC
+  }
+}
+
+# Upload the build context (Dockerfile + entrypoint + gleanflow core) to S3 — only when it changes.
+resource "null_resource" "prep_context" {
+  triggers = { ctx = "%%CTX_HASH%%" }
+  provisioner "local-exec" {
+    command = <<-EOT
+      set -e
+      D=$(mktemp -d)
+      cp -R "%%GLEANFLOW_SRC%%" "$D/gleanflow"
+      cp "%%INFRA_DIR%%/Dockerfile" "%%INFRA_DIR%%/entrypoint.sh" "$D/"
+      (cd "$D" && zip -qr context.zip Dockerfile entrypoint.sh gleanflow)
+      aws s3 cp "$D/context.zip" "s3://${aws_s3_bucket.data.bucket}/codebuild-src/context.zip" --region %%REGION%%
+      rm -rf "$D"
+    EOT
+  }
+}
+
+# Run the build (start + poll) — only when the context hash changes, so re-applies don't rebuild.
+resource "null_resource" "run_build" {
+  depends_on = [null_resource.prep_context, aws_codebuild_project.img, aws_iam_role_policy.codebuild]
+  triggers   = { ctx = "%%CTX_HASH%%" }
+  provisioner "local-exec" {
+    command = <<-EOT
+      set -e
+      ID=$(aws codebuild start-build --project-name ${aws_codebuild_project.img.name} --region %%REGION%% --query 'build.id' --output text)
+      echo "codebuild started: $ID"
+      while :; do
+        S=$(aws codebuild batch-get-builds --ids "$ID" --region %%REGION%% --query 'builds[0].buildStatus' --output text)
+        [ "$S" = "IN_PROGRESS" ] || break
+        sleep 10
+      done
+      echo "codebuild status: $S"
+      [ "$S" = "SUCCEEDED" ]
+    EOT
+  }
+}
+
 # ---- IAM -------------------------------------------------------------------
 data "aws_iam_policy_document" "assume_ecs" {
   statement {
@@ -74,6 +187,14 @@ data "aws_iam_policy_document" "job" {
     actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:SendMessage",
                  "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes"]
     resources = [aws_sqs_queue.tasks.arn, aws_sqs_queue.dlq.arn]
+  }
+  # extra read-only source buckets (e.g. raw zigzag + tns) — GET/LIST only
+  dynamic "statement" {
+    for_each = length(local.read_arns) > 0 ? [1] : []
+    content {
+      actions   = ["s3:GetObject", "s3:ListBucket"]
+      resources = local.read_arns
+    }
   }
 }
 resource "aws_iam_role_policy" "job" {
@@ -134,14 +255,16 @@ resource "aws_batch_job_definition" "worker" {
   name                  = "${local.project}-gf-worker"
   type                  = "container"
   platform_capabilities = ["FARGATE"]
+  depends_on            = [null_resource.run_build]   # job def uses the CodeBuild-pushed :latest
   container_properties = jsonencode({
-    image      = "%%IMAGE%%"
+    image      = "${aws_ecr_repository.img.repository_url}:latest"
     command    = ["/entrypoint.sh"]
     jobRoleArn       = aws_iam_role.job.arn
     executionRoleArn = aws_iam_role.exec.arn
     networkConfiguration = { assignPublicIp = "ENABLED" }
-    runtimePlatform      = { cpuArchitecture = "X86_64", operatingSystemFamily = "LINUX" }
+    runtimePlatform      = { cpuArchitecture = "ARM64", operatingSystemFamily = "LINUX" }
     fargatePlatformConfiguration = { platformVersion = "LATEST" }
+    ephemeralStorage     = { sizeInGiB = 50 }          # base rows can be large (invest-zigzag template)
     resourceRequirements = [
       { type = "VCPU",   value = "%%VCPU%%" },
       { type = "MEMORY", value = "%%MEM%%" }

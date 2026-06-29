@@ -33,6 +33,8 @@ class PipelineConfig:
     lease_seconds: float = 300.0        # task lease / SQS visibility timeout
     heartbeat_seconds: float = 30.0     # how often a worker extends its lease
     max_redeliveries: int = 3           # -> DLQ after this many failed deliveries
+    worker_failure_cap: int = 8         # abort a stage if this many worker jobs FAIL with 0 task progress
+                                        # (catches a crash-loop: bad image/import dies before claiming a task)
 
     # --- defaults for stages without explicit resources -------------------
     default_vcpu: int = 2
